@@ -1,0 +1,19 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# upstream git histories of the vendored repos (renamed from .git)
+.git_upstream/
+
+# experiment outputs, memory stores, logs (large / regenerable)
+memory_stores/
+scratch_*/
+*.log
+*_hashes_before.json
+*_hashes_after.json
+EvoMemBench/Cross-Episode-Execution/Embodied-AI/CROSSEP-EMB/output/
+EvoMemBench/Cross-Episode-Execution/Tool-Using/CROSSEP-TOOL/cross_episode_results/
+ace-appworld/experiments/outputs/
+ace-appworld/data/
