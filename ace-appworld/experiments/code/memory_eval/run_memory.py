@@ -181,17 +181,20 @@ def run_tasks_worker(args: dict) -> list[str]:
     os.environ.setdefault("APPWORLD_PROJECT_PATH", PROJECT)
 
     memory = None
+    online = args.get("online", False)
     if args["system"] not in ("no_memory", "ace"):
         mtype, cfg = memory_spec(args["system"], args["mem_dir"], args["model"], args["emb"])
-        memory = LoggedMemory(create_memory(mtype, read_only=True, **cfg),
-                              log_path=os.path.join(args["out_dir"], "retrieval_log.jsonl"), phase="test")
+        memory = LoggedMemory(create_memory(mtype, read_only=not online, **cfg),
+                              log_path=os.path.join(args["out_dir"], "memory_log.jsonl" if online
+                                                    else "retrieval_log.jsonl"),
+                              phase="online" if online else "test")
     fixed = open(args["ace_playbook"], encoding="utf-8").read() if args["system"] == "ace" else ""
     agent = make_agent(args["run_dir"], args["model"], args["max_steps"], memory, fixed)
     # solve_tasks() normally does this; we call solve_task() per task to evaluate in between.
     agent.logger.initialize(experiment_name=args["experiment"], num_tasks=len(args["task_ids"]),
                             num_processes=1, process_index=0)
     errors = []
-    for tid in args["task_ids"]:
+    for pos, tid in enumerate(args["task_ids"]):
         out = os.path.join(args["out_dir"], f"{tid}.json")
         if os.path.exists(out):
             continue
@@ -213,6 +216,13 @@ def run_tasks_worker(args: dict) -> list[str]:
                 "inject_stats": getattr(agent, "inject_stats", None),
                 "conversation": trajectory_conversation(base, msgs),
             }
+            if online and memory is not None:
+                # online test: ingest this task right away, with the same signal as `build`
+                # (reward = all unit tests pass); the conversation holds no injected memory text.
+                memory.set_context(tid)
+                st = memory.update(rec["conversation"], 10000 + args.get("task_pos", {}).get(tid, pos),
+                                   reward=1.0 if rec["success"] else 0.0)
+                rec["update_stats"] = st.to_dict()
             with open(out, "w", encoding="utf-8") as f:
                 json.dump(rec, f, ensure_ascii=False, indent=1)
             print(f"[{args['system']}] {tid} success={rec['success']} tests={rec['pass_count']}/{rec['num_tests']} "
@@ -226,14 +236,16 @@ def run_tasks_worker(args: dict) -> list[str]:
 def run_split(system: str, task_ids: list[str], out_dir: str, a, experiment: str) -> int:
     os.makedirs(out_dir, exist_ok=True)
     todo = [t for t in task_ids if not os.path.exists(os.path.join(out_dir, f"{t}.json"))]
-    procs = 1 if (system in SERIAL_TEST and not a.force_parallel) else max(1, min(a.procs, len(todo)))
+    procs = 1 if (getattr(a, "online", False) or (system in SERIAL_TEST and not a.force_parallel)) \
+        else max(1, min(a.procs, len(todo)))
     print(f"[{system}] {len(task_ids)} tasks, {len(todo)} to run, {procs} processes -> {out_dir}", flush=True)
     if not todo:
         return 0
     chunks = [todo[i::procs] for i in range(procs)]
     base = {"system": system, "out_dir": out_dir, "run_dir": a.run_dir, "mem_dir": a.mem_dir,
             "model": a.model, "emb": a.emb, "max_steps": a.max_steps, "experiment": experiment,
-            "ace_playbook": a.ace_playbook}
+            "ace_playbook": a.ace_playbook, "online": getattr(a, "online", False),
+            "task_pos": {t: i for i, t in enumerate(task_ids)}}  # stable ids for online updates
     errors = []
     with ProcessPoolExecutor(max_workers=procs) as ex:
         for fut in as_completed([ex.submit(run_tasks_worker, dict(base, task_ids=c)) for c in chunks]):
@@ -310,9 +322,92 @@ def test_ids(a) -> list[str]:
     return ids
 
 
+ACE_ONLINE_START = f"{PROJECT}/experiments/playbooks/thesis_ace_online_start_gpt-4.1-mini.txt"
+ACE_ONLINE_PLAYBOOK = f"{PROJECT}/experiments/playbooks/thesis_ace_online_gpt-4.1-mini.txt"
+
+
+def step_ace_online(a, ids: list[str]) -> int:
+    """ACE online test-time adaptation with the official ACE agent (no ground truth): starting
+    from the offline-trained playbook, each test task is solved, reflected on and curated into
+    the playbook, in order. Resumable: continues from the last persisted playbook."""
+    from appworld.evaluator import evaluate_task
+    from appworld_experiments.code.ace.adaptation_agent import StarAgent
+    import appworld_experiments.code.ace.adaptation_react  # noqa: F401 (registers the agent type)
+
+    out_dir = os.path.join(a.run_dir, "test_online", a.test_split, "ace")
+    os.makedirs(out_dir, exist_ok=True)
+    experiment = f"thesis_online_{a.test_split}_ace"
+    start = ACE_ONLINE_PLAYBOOK if os.path.exists(ACE_ONLINE_PLAYBOOK) else ACE_ONLINE_START
+    if not os.path.exists(start):
+        print(f"[skip] ace online: start playbook missing ({ACE_ONLINE_START}); run online_init")
+        return 1
+    model_cfg = {"name": a.model, "provider": "openai", "temperature": 0, "seed": 100,
+                 "stop": ["<|endoftext|>", "<|eot_id|>", "<|start_header_id|>"], "logprobs": False,
+                 "top_logprobs": None, "frequency_penalty": 0, "presence_penalty": 0, "n": 1,
+                 "response_format": {"type": "text"}, "retry_after_n_seconds": 10,
+                 "use_cache": False, "max_retries": 50}
+    prompts = f"{PROJECT}/experiments/prompts"
+    agent = StarAgent.from_dict({
+        "type": "ace_adaptation_react",
+        "generator_model_config": model_cfg, "reflector_model_config": model_cfg,
+        "curator_model_config": model_cfg,
+        "appworld_config": {"random_seed": 123},
+        "logger_config": {"color": False, "verbose": False},
+        "generator_prompt_file_path": f"{prompts}/appworld_react_generator_prompt.txt",
+        "reflector_prompt_file_path": f"{prompts}/appworld_react_reflector_no_gt_prompt.txt",
+        "curator_prompt_file_path": f"{prompts}/appworld_react_curator_prompt.txt",
+        "initial_playbook_file_path": start,
+        "trained_playbook_file_path": ACE_ONLINE_PLAYBOOK,
+        "ignore_multiple_calls": True, "max_steps": a.max_steps,
+        "max_cost_overall": 1000, "max_cost_per_task": 10, "log_lm_calls": True,
+    })
+    agent.logger.initialize(experiment_name=experiment, num_tasks=len(ids), num_processes=1, process_index=0)
+    print(f"[ace online] {len(ids)} tasks, start playbook {start} ({len(agent.playbook)} chars)", flush=True)
+    errors = []
+    for i, tid in enumerate(ids):
+        out = os.path.join(out_dir, f"{tid}.json")
+        if os.path.exists(out):
+            continue
+        t0, before = time.time(), len(agent.playbook)
+        try:
+            agent.current_task_index = i
+            agent.solve_task(tid, experiment)
+            tracker, _ = evaluate_task(tid, experiment)
+            with open(ACE_ONLINE_PLAYBOOK, "w", encoding="utf-8") as f:  # persist even if no curation ran
+                f.write(agent.playbook)
+            open(os.path.join(out_dir, f"playbook_after_{i:03d}_{tid}.txt"), "w", encoding="utf-8").write(agent.playbook)
+            rec = {"task_id": tid, "instruction": agent.world.task.instruction,
+                   "success": bool(tracker.success), "pass_count": tracker.pass_count,
+                   "num_tests": tracker.num_tests, "steps": agent.step_number,
+                   "latency": time.time() - t0, "injected": "", "inject_stats": None,
+                   "playbook_chars_before": before, "playbook_chars_after": len(agent.playbook)}
+            json.dump(rec, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+            print(f"[ace online] {tid} success={rec['success']} tests={rec['pass_count']}/{rec['num_tests']} "
+                  f"playbook {before}->{len(agent.playbook)} {rec['latency']:.0f}s", flush=True)
+        except Exception as e:
+            errors.append(f"{tid}: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            break  # keep the task order: stop at the first failure, resume later
+    return 1 if errors else 0
+
+
 def step_test(a):
     ids = test_ids(a)
     rc = 0
+    if a.online:  # memory updated after every task, in task order, on memory_online/
+        for name in a.systems:
+            if name == "no_memory":
+                continue  # nothing to update; compare with the frozen no_memory run
+            if name == "ace":
+                rc |= step_ace_online(a, ids)
+                continue
+            if not os.path.exists(os.path.join(a.mem_dir, name, "build_summary.json")):
+                print(f"[skip] {name}: no online working copy in {a.mem_dir} (run online_init)")
+                rc |= 1
+                continue
+            rc |= run_split(name, ids, os.path.join(a.run_dir, "test_online", a.test_split, name), a,
+                            f"thesis_online_{a.test_split}_{name}")
+        return rc
     for name in a.systems:
         if name == "ace" and not os.path.exists(a.ace_playbook):
             print(f"[skip] ace: trained playbook not found at {a.ace_playbook}")
@@ -375,12 +470,14 @@ def main():
     p.add_argument("--test_n", type=int, default=0, help="evenly spaced subset of the test split (0 = all)")
     p.add_argument("--test_first", type=int, default=0, help="first N tasks of the split, in order")
     p.add_argument("--ace_playbook", default=ACE_PLAYBOOK_DEFAULT)
+    p.add_argument("--online", action="store_true",
+                   help="test: update memory after every task (sequential) on memory_online/ -> test_online/")
     a = p.parse_args()
     a.model = a.model or llm_model()
     a.emb = a.embed_model or embed_model()
     os.environ["LLM_MODEL"], os.environ["EMBED_MODEL"] = a.model, a.emb
     os.makedirs(a.run_dir, exist_ok=True)
-    a.mem_dir = os.path.join(a.run_dir, "memory")
+    a.mem_dir = os.path.join(a.run_dir, "memory_online" if a.online else "memory")
     if a.systems is None:
         a.systems = (["no_memory", "ace"] if a.step in ("test", "all") else []) + SYSTEMS
     rc = 0
@@ -390,7 +487,7 @@ def main():
         rc |= step_build(a)
     if a.step in ("test", "all"):
         rc |= step_test(a)
-    if a.step in ("report", "all", "test"):
+    if a.step == "report" or (a.step in ("all", "test") and not a.online):
         rc |= step_report(a)
     sys.exit(rc)
 

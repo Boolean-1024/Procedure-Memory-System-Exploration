@@ -18,3 +18,5 @@ EvoMemBench/Cross-Episode-Execution/Tool-Using/CROSSEP-TOOL/cross_episode_result
 ace-appworld/experiments/outputs/
 ace-appworld/data/
 hf_dataset/
+checkpoints/
+hf_online/

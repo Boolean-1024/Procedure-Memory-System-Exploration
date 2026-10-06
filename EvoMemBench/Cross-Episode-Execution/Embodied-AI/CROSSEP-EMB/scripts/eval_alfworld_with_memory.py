@@ -252,10 +252,12 @@ def eval_one(data_idx, env_args, agent, max_rounds, memory):
 
     # Memory inject: retrieve relevant past experience and inject into system prompt.
     inject_stats = MemoryCallStats()
+    raw_prefix = [dict(m) for m in conversation]  # before injection (used for the online update)
     if memory is not None:
         if hasattr(memory, "set_context"):
             memory.set_context(data_idx)
         conversation, inject_stats = memory.inject(conversation)
+    injected_prefix_len = len(conversation)
 
     # Context caching: cache conversation[:2] (system prompt + greeting) per episode.
     context_id = None
@@ -302,7 +304,11 @@ def eval_one(data_idx, env_args, agent, max_rounds, memory):
     # Memory update: store trajectory in memory bank.
     update_stats = MemoryCallStats()
     if memory is not None:
-        update_stats = memory.update(conversation, data_idx, reward=reward)
+        # Thesis: store the agent's own episode, without the retrieved memory text that was
+        # injected into the prompt -- the same format as the train rollouts used to build the
+        # store, and no recursive copies of old experience. (No-op when the store is read-only.)
+        own_episode = raw_prefix + conversation[injected_prefix_len:]
+        update_stats = memory.update(own_episode, data_idx, reward=reward)
 
     sample_latency = time.time() - sample_t0   # Total wall-clock latency for this sample.
 

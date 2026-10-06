@@ -87,6 +87,67 @@ def memory_kwargs(memory_type: str, memory_dir: Path, *, api_key: str, mem_model
     return kwargs, log
 
 
+class DeferredUpdateMemory:
+    """Thesis (online test): hold back the handler's end-of-sample ``update()`` so the sample can
+    be checked first, then ingest it with the same signal as the build step (AWM: ``is_correct``).
+
+    The handler calls begin_sample -> utilize -> ... -> update -> drain_usage; ``update`` here
+    only records the trajectory, and ``commit()`` performs the real (logged) write afterwards.
+    """
+
+    def __init__(self, inner, memory_type: str):
+        self.inner = inner
+        self.memory_type = memory_type
+        self.readonly = False
+        self.pending: Optional[list] = None
+        self.last_snippet: str = ""
+
+    def begin_sample(self) -> None:
+        self.pending, self.last_snippet = None, ""
+        self.inner.begin_sample()
+
+    def utilize(self, query: str) -> str:
+        self.last_snippet = self.inner.utilize(query) or ""
+        return self.last_snippet
+
+    def update(self, trajectory: list[dict], **kwargs) -> None:
+        self.pending = list(trajectory)
+
+    def drain_usage(self):
+        return self.inner.drain_usage()
+
+    def commit(self, success: bool) -> int:
+        """Write the held trajectory without the injected memory message. Returns #messages."""
+        traj = self.pending or []
+        if (traj and traj[0].get("role") == "system" and self.last_snippet
+                and (traj[0].get("content") or "").strip() == self.last_snippet.strip()):
+            traj = traj[1:]  # the retrieved-memory system message added in FC mode
+        if self.memory_type == "agent_workflow":
+            self.inner.update(traj, metadata={"is_correct": bool(success)})
+        else:
+            self.inner.update(traj)
+        self.pending = None
+        return len(traj)
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["inner"], name)
+
+
+_GT_CACHE: dict = {}
+
+
+def check_sample(handler, entry: dict, raw_result, model: str) -> int:
+    """1 if the sample passes the official multi-turn checker (same logic as run_batch_evaluate)."""
+    from bfcl_eval.scripts.cross_episode.run_batch_evaluate import GROUND_TRUTH_PATH, _evaluate_entry
+    if not _GT_CACHE:
+        for gt in load_file(GROUND_TRUTH_PATH, sort_by_id=False, use_lock=False):
+            _GT_CACHE[gt["id"]] = gt["ground_truth"]
+    slug = model.replace("/", "_").replace(":", "_")
+    success, _, _ = _evaluate_entry(handler, entry["id"], raw_result, _GT_CACHE.get(entry["id"], []),
+                                    copy.deepcopy(entry), slug)
+    return success
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--num-workers", type=int, default=8)
@@ -113,6 +174,9 @@ def parse_args() -> argparse.Namespace:
                    help="Clear the memory store before this run (default: True).")
     p.add_argument("--memory-readonly", action="store_true", default=False,
                    help="Only read from memory (utilize), never write (update).")
+    p.add_argument("--memory-online", action="store_true", default=False,
+                   help="Online test: after each sample, check it and then update memory "
+                        "(requires --num-workers 1; samples run in dataset order).")
     p.add_argument("--memory-load-from", type=Path, default=None,
                    help="Load an existing memory store from this directory (implies --no-memory-clear).")
     p.add_argument("--memory-top-k", type=int, default=3,
@@ -175,6 +239,7 @@ def process_one_sample(
     jsonl_lock: threading.Lock,
     logger: logging.Logger,
     memory: Optional[Memory] = None,
+    model: str = "",
 ) -> Optional[str]:
     """Run inference for one sample and append a JSON line to result.jsonl.
 
@@ -206,6 +271,17 @@ def process_one_sample(
             traceback.format_exc(),
         )
 
+    online_update = None
+    if isinstance(memory, DeferredUpdateMemory) and memory.pending is not None:
+        try:
+            success = check_sample(handler, entry, all_responses, model) if error is None else 0
+            n_msg = memory.commit(success)
+            online_update = {"success": success, "num_messages": n_msg}
+        except Exception as exc:
+            online_update = {"error": f"{type(exc).__name__}: {exc}"}
+            logger.warning("online memory update failed for %s: %r\n%s",
+                           entry["id"], exc, traceback.format_exc())
+
     line = make_json_serializable({
         # Original BFCL-compatible fields
         "id": entry["id"],
@@ -221,6 +297,7 @@ def process_one_sample(
         "per_turn_totals": metadata.get("per_turn_totals", []),
         "sample_totals": metadata.get("sample_totals", {}),
         "memory_usage": metadata.get("memory_usage"),
+        "online_update": online_update,
         "force_quit": metadata.get("force_quit", False),
         "full_message_history": metadata.get("full_message_history", []),
         "error": error,
@@ -287,7 +364,13 @@ def main() -> int:
             log_path=str(args.memory_log or (output_dir / "memory_log.jsonl")),
             phase=args.log_phase or ("test" if args.memory_readonly else "online"),
         )
+        if args.memory_online:
+            if args.memory_readonly or args.num_workers != 1:
+                print("--memory-online needs a writable store and --num-workers 1", file=sys.stderr)
+                return 2
+            memory = DeferredUpdateMemory(memory, args.memory_type)
         memory_config_log.update({
+            "memory_online": args.memory_online,
             "memory_dir": str(memory_dir),
             "memory_model": mem_model,
             "memory_clear": do_clear,
@@ -372,7 +455,7 @@ def main() -> int:
     def _task(entry):
         category = id_to_category.get(entry["id"], "uncategorized")
         return process_one_sample(
-            handler, entry, category, jsonl_path, jsonl_lock, logger, memory=memory
+            handler, entry, category, jsonl_path, jsonl_lock, logger, memory=memory, model=model
         )
 
     n_error = 0

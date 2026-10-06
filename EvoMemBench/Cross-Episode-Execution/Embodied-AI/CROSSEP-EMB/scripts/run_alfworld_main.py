@@ -238,9 +238,12 @@ def step_test(a, env, specs):
     else:
         idx = stratified(os.path.join(MAPPINGS, "mappings_test.json"), TEST_RANGE[0], a.test_subset, a.seed)
     rc = 0
+    # --online: the memory is updated after every test game (inject -> play -> update), in
+    # game order, on a working copy of the store (memory_online/); results go to test_online/.
+    online_specs = system_specs(os.path.join(a.run_dir, "memory_online"), a.model, a.emb) if a.online else None
     for name in a.systems:
-        out = os.path.join(a.run_dir, "test", name)
-        par = 1 if (name in SERIAL_TEST and not a.force_parallel) else a.parallel
+        out = os.path.join(a.run_dir, "test_online" if a.online else "test", name)
+        par = 1 if a.online else (1 if (name in SERIAL_TEST and not a.force_parallel) else a.parallel)
         cmd = [sys.executable, os.path.join(SCRIPTS_DIR, "eval_alfworld_with_memory.py"),
                "--port", str(a.port), "--max_rounds", str(a.max_rounds), "--parallel", str(par),
                "--output_dir", out, *indices_arg(idx, TEST_RANGE)]
@@ -248,6 +251,17 @@ def step_test(a, env, specs):
             cmd += ["--temperature", str(a.temperature)]
         if name == "no_memory":
             cmd += ["--no_memory"]
+        elif a.online:
+            mtype, cfg, stores = online_specs[name]
+            if not all(os.path.exists(s) for s in stores):
+                print(f"[skip] {name}: no online working copy in memory_online/ (run online_init first)")
+                rc |= 1
+                continue
+            cfg_path = os.path.join(a.run_dir, "configs_online", f"{name}.json")
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), indent=2)
+            cmd += ["--memory_type", mtype, "--memory_config", cfg_path,
+                    "--memory_log", os.path.join(out, "memory_log.jsonl"), "--log_phase", "online"]
         else:
             mtype, _, _ = specs[name]
             cfg_path = os.path.join(a.run_dir, "configs", f"{name}.json")
@@ -257,7 +271,8 @@ def step_test(a, env, specs):
                 continue
             cmd += ["--memory_type", mtype, "--memory_config", cfg_path, "--readonly_memory",
                     "--memory_log", os.path.join(out, "retrieval_log.jsonl"), "--log_phase", "test"]
-        rc |= run(cmd, env, os.path.join(a.run_dir, "logs", f"test_{name}.log"))
+        log_name = f"test_online_{name}.log" if a.online else f"test_{name}.log"
+        rc |= run(cmd, env, os.path.join(a.run_dir, "logs", log_name))
     return rc
 
 
@@ -344,12 +359,15 @@ def main():
                    help="stratified subset of the 200 test games (pilot runs)")
     p.add_argument("--test_first", type=int, default=0,
                    help="test the first N test games in index order (overrides --test_subset)")
+    p.add_argument("--online", action="store_true",
+                   help="test: update memory after every game (sequential), on memory_online/ -> test_online/")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
 
     model = a.model or llm_model()
     emb = a.embed_model or embed_model()
+    a.model, a.emb = model, emb
     a.run_dir = os.path.abspath(a.run_dir or os.path.join(BASE_DIR, "output", f"main_{model}"))
     os.makedirs(a.run_dir, exist_ok=True)
     mem_dir = os.path.join(a.run_dir, "memory")

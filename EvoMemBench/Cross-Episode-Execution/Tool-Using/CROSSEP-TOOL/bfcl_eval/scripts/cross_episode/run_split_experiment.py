@@ -207,11 +207,22 @@ def step_test(a, split) -> int:
                 ids = ids[:k]
             if not ids:
                 continue
-            out_dir = a.run_dir / "test" / name
-            workers = 1 if (name in SERIAL_TEST and not a.force_parallel) else a.workers
+            out_dir = a.run_dir / ("test_online" if a.online else "test") / name
+            workers = 1 if (a.online or (name in SERIAL_TEST and not a.force_parallel)) else a.workers
             cmd = generate_cmd(a, out_dir, env, ids, workers)
             if name == "no_memory":
                 cmd += ["--memory-type", "none"]
+            elif a.online:
+                # online test: memory_online/ working copy, updated after every sample in id order
+                mtype, top_k = SYSTEMS[name]
+                mdir = a.run_dir / "memory_online" / name / env
+                if not (mdir / "build_summary.json").exists():
+                    print(f"[skip] {name}/{env}: no online working copy (run online_init first)")
+                    rc |= 1
+                    continue
+                cmd += ["--memory-type", mtype, "--memory-load-from", str(mdir), "--memory-online",
+                        "--memory-top-k", str(top_k),
+                        "--memory-log", str(out_dir / env / "memory_log.jsonl"), "--log-phase", "online"]
             else:
                 mtype, top_k = SYSTEMS[name]
                 mdir = a.run_dir / "memory" / name / env
@@ -222,7 +233,7 @@ def step_test(a, split) -> int:
                 cmd += ["--memory-type", mtype, "--memory-load-from", str(mdir), "--memory-readonly",
                         "--memory-top-k", str(top_k),
                         "--memory-log", str(out_dir / env / "memory_log.jsonl"), "--log-phase", "test"]
-            log = a.run_dir / "logs" / f"test_{name}_{env}.log"
+            log = a.run_dir / "logs" / (f"test_online_{name}_{env}.log" if a.online else f"test_{name}_{env}.log")
             rc |= run(cmd, log)
             rc |= run(evaluate_cmd(out_dir / env / "result.jsonl"), log)
     return rc
@@ -296,6 +307,8 @@ def main() -> int:
     p.add_argument("--mode", choices=["FC", "prompting"], default="FC")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--force_parallel", action="store_true")
+    p.add_argument("--online", action="store_true",
+                   help="test: update memory after every sample (sequential) on memory_online/ -> test_online/")
     p.add_argument("--test_per_env", default="",
                    help="test only the first N test samples of each environment: '3', or per env "
                         "in ENVS order '3,3,2,2' (default: all 25)")
